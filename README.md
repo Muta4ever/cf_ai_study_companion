@@ -191,9 +191,9 @@ This project was created as part of a Cloudflare technical assessment. Feel free
 
 ## 👤 Author
 
-[Your Name]
-- GitHub: [@yourusername](https://github.com/yourusername)
-- Email: your.email@example.com
+Mutawakil Rabiu
+- GitHub: [@yourusername](https://github.com/Muta4ever)
+- Email: sraba417@gmail.com
 
 ---
 

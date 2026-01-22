@@ -192,7 +192,7 @@ This project was created as part of a Cloudflare technical assessment. Feel free
 ## 👤 Author
 
 Mutawakil Rabiu
-- GitHub: [@yourusername](https://github.com/Muta4ever)
+- GitHub: [Muta4ever](https://github.com/Muta4ever)
 - Email: sraba417@gmail.com
 
 ---

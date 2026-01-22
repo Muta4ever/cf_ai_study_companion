@@ -1,65 +1,172 @@
-import { DurableObject } from "cloudflare:workers";
+import { UserMemory } from "./userMemory";
 
-/**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
- */
+interface ChatRequestBody {
+  userId?: string;
+  message?: string;
+  doc?: string;
+}
 
+// Estimate token count (rough approximation: 1 token ≈ 4 characters)
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
 
-/** A Durable Object's behavior is defined in an exported Javascript class */
-export class MyDurableObject extends DurableObject {
-	/**
-	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-	 *
-	 * @param ctx - The interface for interacting with Durable Object state
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 */
-	constructor(ctx: DurableObjectState, env: Env) {
-		super(ctx, env);
-	}
-
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @param name - The name provided to a Durable Object instance from a Worker
-	 * @returns The greeting to be sent back to the Worker
-	 */
-	async sayHello(name: string): Promise<string> {
-		return `Hello, ${name}!`;
-	}
+// Truncate document if too large
+function truncateDocument(doc: string, maxTokens: number = 4000): { text: string; wasTruncated: boolean } {
+  const tokens = estimateTokens(doc);
+  if (tokens <= maxTokens) {
+    return { text: doc, wasTruncated: false };
+  }
+  
+  // Truncate to max tokens worth of characters
+  const maxChars = maxTokens * 4;
+  return { 
+    text: doc.substring(0, maxChars), 
+    wasTruncated: true 
+  };
 }
 
 export default {
-	/**
-	 * This is the standard fetch handler for a Cloudflare Worker
-	 *
-	 * @param request - The request submitted to the Worker from the client
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 * @param ctx - The execution context of the Worker
-	 * @returns The response to be sent back to the client
-	 */
-	async fetch(request, env, ctx): Promise<Response> {
-		// Create a stub to open a communication channel with the Durable Object
-		// instance named "foo".
-		//
-		// Requests from all Workers to the Durable Object instance named "foo"
-		// will go to a single remote Durable Object instance.
-		const stub = env.MY_DURABLE_OBJECT.getByName("foo");
+  async fetch(request: Request, env: any) {
+    const url = new URL(request.url);
+    
+    // Only handle POST /chat
+    if (url.pathname === "/chat" && request.method === "POST") {
+      try {
+        // Safely parse message, userId, doc
+        const body = (await request.json()) as ChatRequestBody;
+        const message = body.message || "";
+        const userId = body.userId || "demo";
+        const doc = body.doc || "";
+        
+        // Get Durable Object stub for this user
+        const id = env.USER_MEMORY.idFromName(userId);
+        const stub = env.USER_MEMORY.get(id);
+        
+        // Get previous memory
+        const previousMemoryRes = await stub.fetch("https://memory");
+        const previous = previousMemoryRes.ok
+          ? await previousMemoryRes.json()
+          : { history: [] };
+        
+        // Enhanced system prompt with Q&A features
+        const systemPrompt = `You are an intelligent study assistant with the following capabilities:
 
-		// Call the `sayHello()` RPC method on the stub to invoke the method on
-		// the remote Durable Object instance.
-		const greeting = await stub.sayHello("world");
+1. **Answer Questions Thoughtfully**: Provide clear, comprehensive answers to study questions.
 
-		return new Response(greeting);
-	},
-} satisfies ExportedHandler<Env>;
+2. **Suggest Further Reading**: After answering, always recommend specific topics, concepts, or areas the student should explore next to deepen their understanding. Be specific about what to read or study.
+
+3. **Document Analysis**: When a document is provided:
+   - Analyze it thoroughly and answer questions based on its content
+   - If asked to summarize, provide a clear, structured summary
+   - If asked for specific information, extract and explain it precisely
+   - Identify and highlight any critical information or key concepts in the document
+   - Point out important topics that are NOT covered in the document but that the student should know about related to the subject matter
+   - Suggest additional resources or topics to study that complement the document
+
+4. **Contextual Learning**: Remember previous questions in the conversation and build on that knowledge to provide more personalized guidance.
+
+5. **Gap Analysis**: When working with documents, actively identify knowledge gaps - topics that are important to the subject but missing from the provided material.
+
+Always be encouraging, clear, and focused on helping the student learn effectively.`;
+        
+        // Combine memory and current doc if available
+        const messages = [
+          {
+            role: "system",
+            content: systemPrompt
+          },
+          ...(previous?.history || []).slice(-20) // Keep last 20 messages from history
+        ];
+        
+        let truncationNotice = "";
+        
+        if (doc) {
+          // Truncate document if needed
+          const { text: processedDoc, wasTruncated } = truncateDocument(doc, 3500);
+          
+          if (wasTruncated) {
+            truncationNotice = "\n\n⚠️ Note: Your document was quite large, so I've analyzed the first portion. For best results with large documents, consider asking about specific sections or topics.";
+          }
+          
+          messages.push({
+            role: "system",
+            content: `The user has uploaded the following document for analysis:
+
+---DOCUMENT START---
+${processedDoc}
+---DOCUMENT END---
+
+${wasTruncated ? "Note: This document was truncated due to length. Focus on what's available." : ""}
+
+Analyze this document and:
+1. Answer any questions the user asks about it
+2. If asked to summarize, provide a clear summary
+3. Identify critical information and key concepts
+4. Point out important related topics NOT covered in this document that the student should know
+5. Suggest specific areas for further reading or study`
+          });
+        }
+        
+        // Add user message
+        messages.push({ role: "user", content: message });
+        
+        // Final check: estimate total tokens
+        const totalText = messages.map(m => m.content).join(" ");
+        const estimatedTokens = estimateTokens(totalText);
+        
+        // Context window is 8000, leave room for response (2000 tokens)
+        if (estimatedTokens > 6000) {
+          return Response.json({ 
+            reply: "📚 Your document or conversation is too large for me to process all at once. Here are some options:\n\n1. Ask me a specific question about a particular section or topic\n2. Upload a smaller document or excerpt\n3. Start a new conversation to reset the context\n\nI'm here to help - just need to work with smaller chunks of information!" 
+          });
+        }
+        
+        // Call Workers AI
+        const aiResponse = await env.AI.run(
+          "@cf/meta/llama-3.1-8b-instruct",
+          {
+            messages
+          }
+        );
+        
+        const aiText = (aiResponse?.response || "Sorry, something went wrong with the AI.") + truncationNotice;
+        
+        // Update memory (keep last 10 messages to manage context size)
+        const updatedHistory = [
+          ...(previous?.history || []),
+          { role: "user", content: message },
+          { role: "assistant", content: aiText }
+        ].slice(-20); // Keep last 10 messages (5 exchanges)
+        
+        await stub.fetch("https://memory", {
+          method: "POST",
+          body: JSON.stringify({ history: updatedHistory })
+        });
+        
+        return Response.json({ reply: aiText });
+        
+      } catch (err: any) {
+        console.error("Error in /chat:", err);
+        
+        // Handle specific AI errors gracefully
+        if (err.message && err.message.includes("context window")) {
+          return Response.json({ 
+            reply: "📚 The content is too large to process. Try:\n\n1. Asking about a specific section\n2. Uploading a shorter document\n3. Starting a new conversation\n\nI'm here to help with smaller, focused questions!" 
+          });
+        }
+        
+        // Return JSON instead of plain text
+        return Response.json(
+          { reply: "Sorry, something went wrong. Please try again or start a new conversation." },
+          { status: 500 }
+        );
+      }
+    }
+    
+    // Fallback response
+    return new Response("AI Study Companion running");
+  }
+};
+
+export { UserMemory };
